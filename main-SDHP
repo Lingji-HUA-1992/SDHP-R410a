@@ -1,0 +1,1057 @@
+
+/************************************************调试过程***************************************************/
+/**20200321调试与注释；热泵系统（带储液罐）**/
+
+/**202003新增不收敛原因：
+1. 初始化不收敛：ir迭代残差小，HX81015中约227行，times_ir>=100时，误差限从1e-5改为1e-4（已改）；
+2. 初始化不收敛：
+3. 计算不收敛：wd迭代残差小，HX81015中约515行，误差限从1e-4改为2e-4(已改)；
+4. 计算不收敛：pr迭代残差小，Refrigerant_Governing_Equation约140行，times_pr>=11,误差限从1e-7改为5e-6（已改）；
+5. 计算不收敛：储液罐迭代可能不收敛，对times_ir_AC和times_Gr_AC进行分情况讨论；
+6. 计算不收敛：蒸发压力迭代时容易跑偏，可修改ir_ACout_temp的初始迭代值，或增加限制条件（pr_Ein_temp - MPr_E_BFR[0] < ?）
+7. 计算不收敛：ir_ACout_temp第一次迭代和第二次迭代的赋值方法；
+
+/**20200413新增不收敛原因：
+8. 含气率接近0或1时。momr计算值发散，在Refrigerant_Governing_Equation中修改；
+
+/**20200413修改：储液罐方程：将焓值修正为内能**/
+
+/************************************************************************************************************/
+
+
+/**调用库**/
+#include <iostream>
+#include <cmath>
+#include <fstream>
+
+/**宏定义**/
+#define pi 3.14159265
+#define e 2.718281828
+
+using namespace std;
+
+static double N = 40, N_BFR, dN, rat;                                         /**压缩机转速（包括前一时刻），控制信号dN，RAT**/
+static double V = 9.8e-6;                                                     /**压缩机体积**/
+static double cr = 0.08;                                                      /**压缩机余隙容积**/
+static double K = 4.5e-7, K_BFR, dK;                                            /**膨胀阀开度（包括前一时刻），控制信号dK**/
+static double charge = 0.80;                                                  /**实际冲注量**/
+static double yt_S = 0.85;                                                    /**压缩机等熵效率**/
+static double yt_E = 0.9;                                                     /**压缩机电效率**/
+
+/**运行总环境**/
+double Patm = 1.01325e5;                                                      /**标准大气压**/
+double g = 9.8;                                                               /**重力加速度**/
+
+/**换热器热力学参数**/
+double roual = 2700.0, roucu = 8900.0;                                        /**翅片密度，铜管密度**/
+double lal = 203.0, lcu = 407.0;                                              /**翅片导热系数，铜管导热系数**/
+double cal = 880.0, ccu = 390.0;                                              /**翅片比热容，铜管比热容**/
+double roud = 1000, cd = 921.0;                                               /**吸附剂密度，比热容**/
+double RHa[26], Wda[26], RHd[12], Wdd[12];                                    /**等温吸附曲线**/
+
+/**空气参数**/
+double ua, dua;                                                               /**空气流速**/
+double ha;                                                                    /**空气的对流换热系数**/
+double roua = 1.2;                                                            /**空气密度**/
+double mua = 1.845e-5;                                                        /**空气粘度**/
+double ka = 0.0321;                                                           /**空气导热系数**/
+double cpa = 1035.0, cpg = 1864.0;                                            /**干空气比热容，水蒸气比热容**/
+double hfg = 2260000.0;                                                       /**水的汽化潜热**/
+
+/**制冷剂参数(R410a)**/
+double M = 72.58;                                                             /**相对分子质量**/
+double Pr0 = 4902000;                                                         /**制冷剂临界压力**/
+
+/**几何参数(微元划分以换热器本身结构为参考，不考虑实际微元划分)**/
+int ntz = 12, ntx = 4, nf = 128;                                              /**换热器管排数（列数为4），翅片数128**/
+double tf = 1.5e-4, Pf = 2.5e-3, td = 2e-4;                                   /**翅片厚度、fin pitch、硅胶涂覆厚度**/
+double dlx = 22.5e-3, dlz = 24e-3;                                            /**微元横截面长、宽**/
+double Ro = 4.76e-3, Ri = 3.925e-3;                                           /**管外径，管内径**/
+
+/**实际微元划分几何参数**/
+int ny = 4, ny_multiple = 32;                                                 /**翅片数128(=4个微元*32)（列数为4）**/
+int cycle_XYZ = ny * ntx * ntz;                                               /**总微元个数**/
+double dx = dlx, dy = ny_multiple * Pf;                                       /**实际微元长度**/
+
+double Sr = pi * pow(Ri,2);                                                   /**管道截面面积**/
+double Aa = 2 * pi * (Ro + td) * (Pf - tf - 2 * td) + 2 * (dlx * dlz - pi * pow (Ro + td,2));      /**空气侧微元换热面积**/
+double Ar = 2 * pi * Ri * Pf;                                                 /**制冷剂侧微元换热面积**/
+
+double Va = dlx * dlz * Pf;                                                   /**微元体积**/
+double Val = (dlx * dlz - pi * pow (Ro,2)) * tf;                              /**微元铝体积**/
+double Vcu = Pf * pi * (pow (Ro,2) - pow (Ri,2));                             /**微元铜体积**/
+double Vd = Aa * td;                                                          /**微元干燥剂体积、干燥剂涂敷质量**/
+double epsal = Val / (Vcu + Val + Vd), epscu = Vcu / (Vcu + Val + Vd), epsd = Vd / (Vcu + Val + Vd);
+                                                                              /**铝、铜、干燥剂比体积**/
+double V_HX = Sr * Pf * nf * ntz * ntx;                                       /**换热器管内体积**/
+double V_AC = V_HX * 4;                                                      /**储液罐体积**/
+
+double La = Va / Aa;                                                          /**特征长度：空气体积/空气换热面积**/
+double Lad = Vd / Aa;                                                         /**特征长度：除湿剂体积**/
+double LaHX = (Vcu + Val + Vd) / Aa;                                          /**特征长度：DCHE基材体积/空气换热面积**/
+double LrHX = (Vcu + Val + Vd) / Ar;                                          /**特征长度：DCHE基材体积/制冷剂侧换热面积**/
+
+/**时间步长及循环参数**/
+double dlt = 1;                                                               /**时间步长**/
+int cycle_T = 5;                                                              /**计算循环个数**/
+int cycle_Tc = 180, cycle_Th = 180;                                           /**除湿循环次数，解吸循环次数**/
+bool flag_cycle = 0;                                                          /**初始循环标识：0为蒸发器，1为冷凝器**/
+
+ofstream outfileMr1;
+ofstream outfilePr1;
+ofstream outfileIr1;
+ofstream outfileMr2;
+ofstream outfilePr2;
+ofstream outfileIr2;
+ofstream outfileTaout1;
+ofstream outfileYaout1;
+ofstream outfileTf1;
+ofstream outfileWd1;
+ofstream outfileTaout2;
+ofstream outfileYaout2;
+ofstream outfileTf2;
+ofstream outfileWd2;
+
+ofstream outfileMr;
+ofstream outfilePr;
+ofstream outfileIr;
+
+double SaturatedLKT(double Tr);
+double SaturatedGKT(double Tr);
+double SaturatedLUT(double Tr);
+double SaturatedGUT(double Tr);
+double SaturatedLThT(double Tr);
+
+double SaturatedLPT(double Tsat);
+double SaturatedGPT(double Tsat);
+double SaturatedLHT(double Tsat);
+double SaturatedGHT(double Tsat);
+double SaturatedLRouT(double Tsat);
+double SaturatedGRouT(double Tsat);
+double SaturatedLCpT(double Tsat);
+double SaturatedGCpT(double Tsat);
+
+double SaturatedLTP(double Psat);
+double SaturatedGTP(double Psat);
+double SaturatedGST(double T);
+double SaturatedLTH(double hL);
+
+double TwoPhaseHX(double x, double Psat);
+double TwoPhaseXH(double h, double Psat);
+double TwoPhaseTH(double h, double Psat);
+double TwoPhaseHS(double s, double Psat);
+double TwoPhaseSH(double h, double Psat);
+
+double SuperHeatedHT(double P, double T);
+double SuperHeatedRouT(double P, double T);
+double SuperHeatedTH(double P, double h);
+double SuperHeatedST(double P, double h);
+double SuperHeatedTS(double P, double s);
+
+double SubCooledHT(double P, double T);
+double SubCooledTH(double P, double h);
+double SubCooledRouT(double P, double T);
+
+double ConvertYd (double Tf, double Wd);
+
+double InitialHX(double Pr_Ein, double ir_Cout, double mrin0, double Result[],
+              double MPr_BFR[], double MIr_BFR[], double MTr_BFR[], double MRour_BFR[], double MWr_BFR[], double MHr_BFR[],
+              double MTf_BFR[]);
+
+double HX(int j,double Tain, double Yain, double mrin, double Prin, double irin, double Result[],
+       double MTain[], double MTaout[], double MTain_BFR[], double MTaout_BFR[], double MYain[], double MYaout[], double MYain_BFR[], double MYaout_BFR[],
+       double MTf[], double MTf_BFR[], double MWd[], double MWd_BFR[],
+       double MPr[], double MIr[], double MTr[], double MRour[], double MWr[], double MHr[],
+       double MPr_BFR[], double MIr_BFR[], double MTr_BFR[], double MRour_BFR[], double MWr_BFR[], double MHr_BFR[]);
+
+double UpdateHa();
+/*****************************************************************************************************************************/
+
+int main(){
+
+    cout<<V_HX<<'\t'<<Aa * 128 * 48<<endl;
+
+    /**********************************输入输出文件***************************************/
+
+    ifstream infile1("0-Isotherm.txt");                    /**材料等温吸附曲线**/
+    ifstream infile2("0-InitialCondition.txt");            /**换热器初始状态**/
+
+    ofstream outfile1,outfile2;                            //输出迭代过程文件&计算终了时换热器状态-每个微元**/
+    outfile1.open("2-outfile.txt");
+    outfile2.open("2-outfile2.txt");
+
+    /**为在子程序中调用已在主程序之前声明**/
+    outfileMr.open("0-Mr.txt");                            //输出蒸发冷凝温度及节点流量
+    outfilePr.open("0-Pr.txt");                            //输出蒸发压力&冷凝压力**/
+    outfileIr.open("0-Hr.txt");                            //输出速度&流量**/
+    outfileMr1.open("0-Mr1.txt");                          /**输出蒸发侧质量流量（密度&流速）-每个微元**/
+    outfilePr1.open("0-Pr1.txt");                          /**输出蒸发侧压力（温度）-每个微元**/
+    outfileIr1.open("0-Hr1.txt");                          /**输出蒸发侧焓值（对流换热系数）-每个微元**/
+    outfileMr2.open("0-Mr2.txt");                          /**输出冷凝器质量流量（密度&流速）-每个微元**/
+    outfilePr2.open("0-Pr2.txt");                          /**输出冷凝器压力（温度）-每个微元**/
+    outfileIr2.open("0-Hr2.txt");                          /**输出冷凝器焓值（对流换热系数）-每个微元**/
+
+    outfileTaout1.open("1-Ta1.txt");                       /**输出蒸发器空气出口温度（上一时刻值）-每个微元**/
+    outfileYaout1.open("1-Ya1.txt");                       /**输出蒸发器空气出口湿度（上一时刻值）-每个微元**/
+    outfileTf1.open("1-Tf1.txt");                          /**输出蒸发器器件温度（上一时刻值）-每个微元**/
+    outfileWd1.open("1-Wd1.txt");                          /**输出蒸发器吸附剂含湿量（上一时刻值）-每个微元**/
+
+    outfileTaout2.open("1-Ta2.txt");                       /**输出冷凝器空气出口温度（上一时刻值）-每个微元**/
+    outfileYaout2.open("1-Ya2.txt");                       /**输出冷凝器空气出口湿度（上一时刻值）-每个微元**/
+    outfileTf2.open("1-Tf2.txt");                          /**输出冷凝器器件温度（上一时刻值）-每个微元**/
+    outfileWd2.open("1-Wd2.txt");                          /**输出冷凝器吸附剂含湿量（上一时刻值）-每个微元**/
+
+    /***********************************变量定义及初始化***********************************/
+
+    bool start = 1;                                        /**定义开始标识：有些鸡肋？（见系统初始化部分）**/
+
+    int i,i0,j,p;                                          //定义循环变量：空间循环i，时间循环j，等温吸附线矩阵循环p**/
+
+    /**等温吸附线矩阵初始化**/
+    for(p = 0; p <= 26; p++){
+        infile1>>Wda[p]>>RHa[p];
+        if(p <= 12)infile1>>Wdd[p]>>RHd[p];
+    }
+
+    double Tain = 35, Yain = 14.6;                           /**定义空气状态：蒸发器入口空气温度、湿度**/
+    double Tain2 = 27, Yain2 = 11.3;                         /**定义空气状态：冷凝器入口空气温度、湿度**/
+    double Tf = 45, Tf2 = 15;                              /**定义换热器状态：蒸发器冷凝器壁面温度**/
+    double Wd = 0.125, Wd2 = 0.3;                          /**定义吸附剂状态：蒸发器冷凝器吸水量**/
+    double Ta_E_AVR[4], Ya_E_AVR[4], Ta_C_AVR[4], Ya_C_AVR[4];         /**定义空气状态：空气出口温湿度**/
+    double Tf_E_AVR[5], Wd_E_AVR[5], Tf_C_AVR[5], Wd_C_AVR[5];
+
+    bool flag_pr0;                                         /**定义迭代判据：等容压缩压力pr**/
+    int times_pr0;
+    double pr, pr_temp1, pr_temp2;                         /**定义迭代变量：等容压缩压力pr**/
+
+    bool flag_Gr_AC, flag_ir_AC, flag_rour_AC;                           /**定义迭代判据：储液罐制冷剂储量，储液罐出口焓**/
+    int times_Gr_AC, times_ir_AC, times_rour_AC;                          /**定义迭代次数：储液罐制冷剂储量，储液罐出口焓**/
+    double ir_ACout_temp_In, ir_ACout_In, ir_ACout_BFR;    /**定义迭代量：储液罐出口焓，IN代表内循环，BFR代表上一时刻的值，作为迭代初值**/
+    double Gr_AC, Gr_AC_temp, Gr_AC_BFR;                   /**定义迭代量：储液罐制冷剂储量，BFR代表上一时刻的值，作为迭代初值**/
+    double Tr_AC, Tr_AC_BFR, ir_AC, ir_AC_BFR, rour_AC, xr_AC, er_AC;                  /**定义储液罐状态量：温度（包括上一时刻），焓值（包括上一时刻），密度，含气率**/
+    double mr_ACin, mr_ACout;                              /**定义储液罐状态量：进出口流量**/
+    double Tr_ACout, Rour_ACout;                           /**定义储液罐出口状态量：温度和密度**/
+    double rour_AC_temp, rour_AC_BFR, pr_AC_BFR;
+
+    bool flag_ir, flag_pr1, flag_pr2;                      /**定义迭代判据：迭代蒸发器出口焓，迭代冷凝压力，迭代蒸发压力**/
+    int times_ir, times_pr1, times_pr2;                    /**定义迭代指标数：迭代蒸发器出口焓times_ir，迭代冷凝压力times_pr1。迭代蒸发压力times_pr2**/
+    double ir_ACout_temp0, ir_ACout_temp, ir_ACout;        /**定义迭代量：储液罐出口焓**/
+    double Pr_Ein_temp0, Pr_Ein_temp = 1300000, Pr_Ein;    /**定义迭代量：蒸发压力**/
+    double Pr_Cin_temp = 2600000, Pr_Cin;                  /**定义迭代量：冷凝压力**/
+    double Pr_Ein_RES, ir_ACout_RES, Pr_Cin_RES;           /**定义迭代量的变化值：蒸发器入口压力变化，储液罐出口焓变化，冷凝器入口压力变化**/
+    double mr_CM, mr_CM_BFR;                               /**定义压缩机状态量：流量（包括上一时刻）**/
+    double Tr_Cin_ideal, ir_Cin_ideal, ir_Cin;             /**定义压缩机状态量：等熵出口温度，等熵出口焓，实际出口焓**/
+    double mr_VL, mr_VL_BFR;                               /**定义节流阀状态量：流量（包括上一时刻）**/
+    double rou_C_AVR, rou_E_AVR, rou_AVR;                  /**定义换热器状态量：冷凝器平均制冷剂密度，蒸发侧平均制冷剂密度，实时冲注量**/
+    double xr, yt, cp, cv;                                 /**定义计算中间量：含气率，容积效率，等压比热，等容比热**/
+    double irG, TrG, SrG, rouG, irL, TrL, rouL;            /**定义计算中间量：临界焓，温度与熵**/
+
+    double rou0, ir0;                                      /**定义迭代中间量：牛顿迭代法储存y值，冲注量和出口焓**/
+    double THD;                                            /**定义迭代中间量：出口焓迭代阈值**/
+
+    double DLT;
+    double Tc;
+    double E1, E1_BFR, ED1, EI1 = 0;
+    double E2, E2_BFR, ED2, EI2 = 0;
+    double MK[10] = {0}, MN[10] = {0};
+    double C[10];
+
+    for (p = 0; p <= 9; p++){
+        C[p] = exp(-(10 - p - 1) / 2.0) - exp(-(10 - p) / 2.0);
+        cout<<p<<'\t'<<C[p]<<endl;
+    }
+
+
+    /**重要参数微元矩阵**/
+    /**空气侧**/
+    double MTain_E_BFR[cycle_XYZ + 2], MTaout_E_BFR[cycle_XYZ + 2],MTain_C_BFR[cycle_XYZ + 2], MTaout_C_BFR[cycle_XYZ + 2];
+    double MTain_E[cycle_XYZ + 2], MTaout_E[cycle_XYZ + 2], MTain_C[cycle_XYZ + 2], MTaout_C[cycle_XYZ + 2];
+    double MYain_E_BFR[cycle_XYZ + 2], MYaout_E_BFR[cycle_XYZ + 2],MYain_C_BFR[cycle_XYZ + 2], MYaout_C_BFR[cycle_XYZ + 2];
+    double MYain_E[cycle_XYZ + 2], MYaout_E[cycle_XYZ + 2], MYain_C[cycle_XYZ + 2], MYaout_C[cycle_XYZ + 2];
+
+    /**换热器侧**/
+    double MTf_E_BFR[cycle_XYZ + 2], MTf_C_BFR[cycle_XYZ + 2], MTf_E[cycle_XYZ + 2], MTf_C[cycle_XYZ + 2];
+    double MWd_E_BFR[cycle_XYZ + 2], MWd_C_BFR[cycle_XYZ + 2], MWd_E[cycle_XYZ + 2], MWd_C[cycle_XYZ + 2];
+
+    /**制冷剂侧**/
+    double MPr_E_BFR[cycle_XYZ + 2], MIr_E_BFR[cycle_XYZ + 2], MRour_E_BFR[cycle_XYZ + 2], MWr_E_BFR[cycle_XYZ + 2], MTr_E_BFR[cycle_XYZ + 2], MHr_E_BFR[cycle_XYZ + 2];
+    double MPr_C_BFR[cycle_XYZ + 2], MIr_C_BFR[cycle_XYZ + 2], MRour_C_BFR[cycle_XYZ + 2], MWr_C_BFR[cycle_XYZ + 2], MTr_C_BFR[cycle_XYZ + 2], MHr_C_BFR[cycle_XYZ + 2];
+    double MPr_E[cycle_XYZ + 2], MIr_E[cycle_XYZ + 2], MRour_E[cycle_XYZ + 2], MWr_E[cycle_XYZ + 2], MTr_E[cycle_XYZ + 2], MHr_E[cycle_XYZ + 2];
+    double MPr_C[cycle_XYZ + 2], MIr_C[cycle_XYZ + 2], MRour_C[cycle_XYZ + 2], MWr_C[cycle_XYZ + 2], MTr_C[cycle_XYZ + 2], MHr_C[cycle_XYZ + 2];
+    double Result[10];
+
+    /**赋初值（除制冷剂侧）**/
+    for(i0 = 0; i0 <= cycle_XYZ + 1; i0++) {
+        infile2>>i>>MTf_C_BFR[i0]>>MWd_C_BFR[i0]>>MTf_E_BFR[i0]>>MWd_E_BFR[i0]>>MTain_C_BFR[i0]>>MTaout_C_BFR[i0]>>MYain_C_BFR[i0]>>MYaout_C_BFR[i0]>>MTain_E_BFR[i0]>>MTaout_E_BFR[i0]>>MYain_E_BFR[i0]>>MYaout_E_BFR[i0];
+
+        /**MTain_E_BFR[i0] = Tain;
+        MTaout_E_BFR[i0] = Tain;
+        MYain_E_BFR[i0] = Yain;
+        MYaout_E_BFR[i0] = Yain;
+        MTain_C_BFR[i0] = Tain2;
+        MTaout_C_BFR[i0] = Tain2;
+        MYain_C_BFR[i0] = Yain2;
+        MYaout_C_BFR[i0] = Yain2;
+        MTf_E_BFR[i0] = Tf;
+        MTf_C_BFR[i0] = Tf2;
+        MWd_E_BFR[i0] = Wd;
+        MWd_C_BFR[i0] = Wd2;**/
+    }
+
+    /**赋初值：制冷剂侧**/
+    if(start){
+
+        /**迭代循环3：出口焓**/
+        ir_ACout_temp = 1000 * SuperHeatedHT(Pr_Ein_temp, 45.5);                  /**迭代变量初始化**/
+        flag_ir = 1;
+        times_ir = 1;
+        while (flag_ir){
+
+            /**迭代循环2：蒸发压力**/
+            flag_pr2 = 1;
+            times_pr2 = 1;
+            while (flag_pr2){
+
+                /**迭代循环3：冷凝压力**/
+                flag_pr1 = 1;
+                times_pr1 = 1;
+                while (flag_pr1){
+
+                    /**更新压缩机状态**/
+                    /**计算储液罐出口气体等压比热**/
+                    Tr_ACout = SuperHeatedTH(Pr_Ein_temp, ir_ACout_temp) - 273.15;
+                    Rour_ACout = SuperHeatedRouT(Pr_Ein_temp, Tr_ACout);
+                    //cout<<ir_Eout_temp<<endl;
+                    cp = 1000 * (SuperHeatedHT(Pr_Ein_temp,Tr_ACout + 1) - SuperHeatedHT(Pr_Ein_temp,Tr_ACout));
+
+                    /**计算储液罐出口气体等容比热**/
+                    /**迭代等容压缩压力**/
+                    flag_pr0 = 1;
+                    pr_temp1 = Pr_Ein_temp * 0.99;
+                    pr_temp2 = Pr_Ein_temp;
+                    while (flag_pr0){
+                        pr =  (pr_temp2 - pr_temp1) * (Rour_ACout - SuperHeatedRouT(pr_temp2,Tr_ACout + 1)) / (SuperHeatedRouT(pr_temp2,Tr_ACout + 1) - SuperHeatedRouT(pr_temp1,Tr_ACout + 1)) + pr_temp2;
+                        flag_pr0 = (fabs((SuperHeatedRouT(pr,Tr_ACout + 1) - Rour_ACout) / Rour_ACout) < 1e-8) ? 0:1;
+                        pr_temp2 = pr_temp1, pr_temp1 = pr;
+                    }
+                    cv = 1000 * (SuperHeatedHT(pr,Tr_ACout + 1) - SuperHeatedHT(Pr_Ein_temp,Tr_ACout)) - (pr - Pr_Ein_temp) / Rour_ACout;
+                    //cout<<cp<<'\t'<<cv<<endl;
+                    yt = 1 + cr - cr * pow ((Pr_Cin_temp / Pr_Ein_temp), cv / cp);
+                    mr_CM = mr_VL = N * V * Rour_ACout * yt / Sr;
+                    //mr_CM = 540;
+                    //cout<<SuperHeatedST(Pr_Ein_temp, Tr_Eout)<<'\t'<<mr_CM<<endl;
+                    Tr_Cin_ideal = SuperHeatedTS(Pr_Cin_temp,SuperHeatedST(Pr_Ein_temp, Tr_ACout)) - 273.15;
+                    ir_Cin_ideal = 1000 * SuperHeatedHT(Pr_Cin_temp,Tr_Cin_ideal);
+                    ir_Cin = (ir_Cin_ideal - ir_ACout_temp) / yt_S + ir_ACout_temp;
+                    //cout<<Tr_Cin_ideal<<endl;
+                    //cout<<SuperHeatedST(Pr_Ein_temp, Tr_Eout)<<'\t'<<Tr_Cin_ideal<<'\t'<<ir_Cin<<'\t'<<SuperHeatedTH(Pr_Cin_temp, ir_Cin) - 273.15<<endl;
+
+                    /**更新冷凝器状态**/
+                    rou_C_AVR = InitialHX(Pr_Cin_temp,ir_Cin,mr_VL,Result,
+                              MPr_C_BFR,MIr_C_BFR,MTr_C_BFR,MRour_C_BFR,MWr_C_BFR,MHr_C_BFR,MTf_C_BFR);
+                    cout<<Result[0]<<'\t'<<Result[1]<<'\t'<<Result[2]<<'\t'<<Result[3]<<'\t'<<Result[4]<<'\t'<<Result[5]<<endl;
+                    Pr_Cin = Pr_Ein_temp + pow (mr_VL * Sr / K,2) / Result[3];
+                    //cout<<Pr_Cin<<endl;
+                    flag_pr1 = (fabs((Pr_Cin_temp - Pr_Cin) / Pr_Cin) < 1e-5) ? 0:1;
+                    //cout<<flag_pr1<<endl;
+                    Pr_Cin_temp = Pr_Cin;
+                    times_pr1++;
+                }
+                /**迭代循环1结束**/
+
+                /**更新蒸发器状态**/
+                rou_E_AVR = InitialHX(Pr_Ein_temp,Result[1],mr_VL,Result,
+                              MPr_E_BFR,MIr_E_BFR,MTr_E_BFR,MRour_E_BFR,MWr_E_BFR,MHr_E_BFR,MTf_E_BFR);
+                cout<<Result[0]<<'\t'<<Result[1]<<'\t'<<Result[2]<<'\t'<<Result[3]<<'\t'<<Result[4]<<'\t'<<Result[5]<<endl;
+
+                /**更新储液罐状态**/
+                mr_ACout = mr_ACin = Sr * Result[3] * Result[4];
+                ir_ACout_In = Result[1];
+                ir_AC = Result[1];
+                rour_AC = Result[3];
+                Tr_AC = Result[2];
+                Gr_AC = rour_AC * V_AC;
+
+
+                /**更新迭代变量等**/
+                if(times_pr2 == 1)Pr_Ein = Pr_Ein_temp - 1000;
+                else Pr_Ein = (Pr_Ein_temp - Pr_Ein_temp0)/(ir_ACout_In - ir0) * (ir_ACout_temp - ir0) + Pr_Ein_temp0;
+
+                while (fabs(Pr_Ein - Pr_Ein_temp) > 2e4){
+                    Pr_Ein = Pr_Ein_temp / 2 + Pr_Ein / 2 ;
+                    //if(Pr_Ein>=Pr_Ein_temp)Pr_Ein = Pr_Ein_temp + 1e4;
+                    //else Pr_Ein = Pr_Ein_temp - 1e4;
+                }
+                cout<<"attention!"<<'\t'<<times_pr2<<'\t'<<Pr_Ein<<'\t'<<rou_C_AVR<<'\t'<<rou_E_AVR<<'\t'<<ir_ACout_temp<<endl;
+                flag_pr2 = (fabs((ir_ACout_temp - ir_ACout_In) / ir_ACout_In) < 1e-4) ? 0:1;
+                Pr_Ein_temp0 = Pr_Ein_temp;
+                Pr_Ein_temp = Pr_Ein;
+                ir0 = ir_ACout_In;
+                times_pr2++;
+            }
+            /**迭代循环2结束**/
+
+            /**更新迭代变量等**/
+            rou_AVR = rou_C_AVR * V_HX + rou_E_AVR * V_HX + Gr_AC;
+            if(times_ir == 1)ir_ACout = ir_ACout_temp + 1000;
+            else ir_ACout = (ir_ACout_temp - ir_ACout_temp0) / (rou_AVR - rou0) * (charge - rou0) + ir_ACout_temp0;
+            cout<<"attention!!!"<<'\t'<<times_ir<<'\t'<<ir_ACout<<'\t'<<ir_ACout_temp<<'\t'<<ir_ACout_temp0<<'\t'<<rou_AVR<<'\t'<<rour_AC<<endl;
+            flag_ir = 0;
+            flag_ir = (fabs((rou_AVR - charge) / charge) < 1e-3) ? 0:1;
+            ir_ACout_temp0 = ir_ACout_temp;
+            ir_ACout_temp = ir_ACout;
+            rou0 = rou_AVR;
+            times_ir++;
+        }
+        /**迭代循环3结束**/
+    }
+
+    for(j = 1; j <= 180; j++){
+
+        //if (j > 30) j++, dlt = 2;
+        /**赋值：上一时刻的值**/
+        rour_AC_BFR = rour_AC;
+        pr_AC_BFR = MPr_E_BFR[cycle_XYZ + 1];
+        ir_ACout_BFR = ir_ACout;                           /**上一时刻储液罐出口焓**/
+        Tr_AC_BFR = Tr_AC;                                 /**上一时刻储液罐温度**/
+        Gr_AC_BFR = Gr_AC;                                 /**上一时刻储液罐储量**/
+        ir_AC_BFR = ir_AC;                                 /**上一时刻储液罐焓值**/
+        mr_CM_BFR = mr_CM;                                 /**上一时刻压缩机流量**/
+        mr_VL_BFR = mr_VL;                                 /**上一时刻节流阀流量**/
+        K_BFR = K;                                         /**上一时刻节流阀开度**/
+        N_BFR = N;                                         /**上一时刻压缩机转速**/
+
+
+        /**计算控制变量**/
+        if(j <= 35){
+            E1 = 5 - DLT, EI1 = 0, dK = 1;
+            E2 = 50 - Tc - E1 / 6, EI2 = 0, dN = 10;
+        }
+
+        if(j > 35){
+            E1_BFR = E1, E2_BFR = E2;
+            E1 = 5 - DLT, E2 = 50 - Tc;
+            EI1 = EI1 + E1, EI2 = EI2 + E2;
+            ED1 = E1 - E1_BFR, ED2 = E2 - E2_BFR;
+            for (p = 0; p <= 8; p++){MK[p] = MK[p + 1], MN[p] = MN[p + 1];}
+            MK[9] = -1.797914e-8 * (E1 + EI1 / 18 + 4.5 * ED1);
+            MN[9] = E2;
+            dK = 0, dN = 0;
+            for (p = 0; p <= 9; p++){dK = dK + MK[p] * C[p], dN = dN + MN[p] * C[p]; cout<<MK[p]<<'\t'<<dK<<'\t'<<dN<<endl;}
+        }
+
+        /**************************************迭代计算热泵系统状态****************************************/
+
+
+        /**估计此时的储液罐出口焓**/
+        if(j == 1)ir_ACout_temp = ir_ACout;
+        else{
+             if(ir_ACout_RES >= 0)ir_ACout_temp = ir_ACout + min(ir_ACout_RES * 0.6,2e3);
+             else ir_ACout_temp = ir_ACout + max(ir_ACout_RES * 0.6, -2e3);
+        }
+
+        if(j == 8){
+             if(ir_ACout_RES >= 0)ir_ACout_temp = ir_ACout + min(ir_ACout_RES, 2e3);
+             else ir_ACout_temp = ir_ACout + max(ir_ACout_RES, -2e3);
+        }
+        /**估计此时的冷凝压力**/
+        Pr_Cin_temp = MPr_C_BFR[0];
+
+
+        /**迭代循环3-储液罐出口焓**/
+        flag_ir = 1;
+        times_ir = 1;
+        while (flag_ir){
+
+            /**估计此时的蒸发压力**/
+            if (j == 1)Pr_Ein_temp = MPr_E_BFR[0];
+            else Pr_Ein_temp = MPr_E_BFR[0];
+
+            /**迭代循环2——蒸发压力**/
+            flag_pr2 = 1;
+            times_pr2 = 1;
+            while (flag_pr2){
+
+                /**迭代循环1——冷凝压力**/
+                flag_pr1 = 1;
+                times_pr1 = 1;
+                while (flag_pr1){
+
+                    /**更新压缩机状态**/
+                    TrG = SaturatedGTP(Pr_Ein_temp) - 273.15, irG = 1000 * SaturatedGHT(TrG);
+                    TrL = SaturatedLTP(Pr_Ein_temp) - 273.15, irL = 1000 * SaturatedLHT(TrL);
+
+                    /**过热区**/
+                    if (ir_ACout_temp >= irG){
+                        //cout<<"evaporater outlet right!!!"<<'\t'<<j<<endl;
+                        //cout<<Result[0]<<'\t'<<Result[1]<<'\t'<<Result[2]<<'\t'<<Result[3]<<'\t'<<Result[4]<<'\t'<<Result[5]<<endl;
+                        /**储液罐出口制冷剂等压比容**/
+                        Tr_ACout = SuperHeatedTH(Pr_Ein_temp, ir_ACout_temp) - 273.15;
+                        Rour_ACout = SuperHeatedRouT(Pr_Ein_temp, Tr_ACout);
+                        //cout<<ir_Eout_temp<<endl;
+                        cp = 1000 * (SuperHeatedHT(Pr_Ein_temp,Tr_ACout + 1) - SuperHeatedHT(Pr_Ein_temp,Tr_ACout));
+                        //cout<<cp<<endl;
+
+                        /**储液罐出口制冷剂等容比容**/
+                        /**迭代制冷剂等容压缩压力**/
+                        flag_pr0 = 1;
+                        times_pr0 = 1;
+                        pr_temp1 = Pr_Ein_temp * 0.99;
+                        pr_temp2 = Pr_Ein_temp;
+                        while (flag_pr0){
+                            pr =  (pr_temp2 - pr_temp1) * (Rour_ACout - SuperHeatedRouT(pr_temp2,Tr_ACout + 1)) / (SuperHeatedRouT(pr_temp2,Tr_ACout + 1) - SuperHeatedRouT(pr_temp1,Tr_ACout + 1)) + pr_temp2;
+                            flag_pr0 = (fabs((SuperHeatedRouT(pr,Tr_ACout + 1) - Rour_ACout) / Rour_ACout) < 1e-8) ? 0 : 1;
+                            pr_temp2 = pr_temp1, pr_temp1 = pr;
+                            times_pr0++;
+                        }
+                        cv = 1000 * (SuperHeatedHT(pr,Tr_ACout + 1) - SuperHeatedHT(Pr_Ein_temp,Tr_ACout)) - (pr - Pr_Ein_temp) / Rour_ACout;
+
+                        /**计算压缩机状态**/
+                        yt = 1 + cr - cr * pow ((Pr_Cin_temp / Pr_Ein_temp), cv / cp);             /**压缩机容积效率**/
+                        //N = 50;
+                        //dN = 5;
+                        //if(j >= 30)N = (N + dN) - dN * exp( - (j - 30) * dlt / 2);
+                        /**if (fabs(dN / N) > 0.02) {
+                            if(dN > 0)dN = 0.02 * N;
+                            else dN = -0.02 * N;
+                        }
+                        N = dN + N_BFR;
+                        if (j >= 7 && j <= 35) N = N_BFR;
+                        if (N >= 60) N = 60;
+                        if (N <= 20) N = 20;**/
+
+                        mr_CM = N * V * Rour_ACout * yt / Sr;                                        /**压缩机流量**/
+                        Tr_Cin_ideal = SuperHeatedTS(Pr_Cin_temp,SuperHeatedST(Pr_Ein_temp, Tr_ACout)) - 273.15;        /**压缩机等熵温度**/
+                        ir_Cin_ideal = 1000 * SuperHeatedHT(Pr_Cin_temp,Tr_Cin_ideal);              /**压缩机等熵出口焓**/
+                        ir_Cin = (ir_Cin_ideal - ir_ACout_temp) / yt_S + ir_ACout_temp;             /***压缩机实际出口焓**/
+                        //cout<<SuperHeatedST(Pr_Ein_temp, Tr_Eout)<<'\t'<<Tr_Cin<<'\t'<<ir_Cin<<'\t'<<SuperHeatedTH(Pr_Cin_temp, ir_Cin) - 273.15<<endl;
+                        //if(j == 2)break;
+                    }
+
+                    /**两相区**/
+                    else{
+                        /**储液罐出口制冷剂气相等压比容**/
+                        Tr_ACout = TwoPhaseTH(ir_ACout_temp, Pr_Ein_temp) - 273.15;
+                        Rour_ACout = SaturatedGRouT(Tr_ACout);
+                        cp = (1000 * SuperHeatedHT(Pr_Ein_temp,Tr_ACout + 1) - 1000 * SaturatedGHT(Tr_ACout));
+
+                        /**储液罐出口制冷剂气相等容比热**/
+                        /**迭代压缩机等容压缩压力**/
+                        flag_pr0 = 1;
+                        pr_temp1 = Pr_Ein_temp * 0.99;
+                        pr_temp2 = Pr_Ein_temp * 0.98;
+                        while (flag_pr0){
+                            pr =  - (pr_temp2 - pr_temp1) * (SuperHeatedRouT(pr_temp2,TrG + 1) - Rour_ACout) / (SuperHeatedRouT(pr_temp2,TrG + 1) - SuperHeatedRouT(pr_temp1,TrG + 1)) + pr_temp2;
+                            flag_pr0 = (fabs((SuperHeatedRouT(pr,TrG + 1) - Rour_ACout) / Rour_ACout) < 1e-8) ? 0 : 1;
+                            pr_temp2 = pr_temp1, pr_temp1 = pr;
+                        }
+
+                        cv = (1000 * SuperHeatedHT(pr,TrG + 1) - 1000 * SaturatedGHT(Tr_ACout)) - (pr - Pr_Ein_temp) / Rour_ACout;
+
+                        /**计算压缩机热力状态**/
+                        yt = 1 + cr - cr * pow ((Pr_Cin_temp / Pr_Ein_temp), cv / cp);             /**压缩机容积效率**/
+
+                        /**计算压缩机等熵温度和焓值**/
+                        /**临界状态计算**/
+                        TrG = SaturatedGTP(Pr_Cin_temp) - 273.15, SrG = SaturatedGST(TrG);
+                        /**过热区**/
+                        if (TwoPhaseSH(ir_ACout_temp,Pr_Ein_temp) >= SrG){
+                            Tr_Cin_ideal = SuperHeatedTS(Pr_Cin_temp,TwoPhaseSH(ir_ACout_temp,Pr_Ein_temp)) - 273.15;
+                            ir_Cin_ideal = 1000 * SuperHeatedHT(Pr_Cin_temp,Tr_Cin_ideal);         /**压缩机等熵出口焓**/
+                        }
+                        /**两相区**/
+                        else{
+                            //cout<<"condensor inlet warning!!!"<<'\t'<<j<<endl;
+                            ir_Cin_ideal = 1000 * TwoPhaseHS(TwoPhaseSH(ir_ACout_temp,Pr_Ein_temp),Pr_Cin_temp);       /**压缩机等熵出口焓**/
+                            //cout<<ir_Cin_ideal<<'\t'<<endl;
+                        }
+                        ir_Cin = (ir_Cin_ideal - ir_ACout_temp) / yt_S + ir_ACout_temp;            /**压缩机出口焓**/
+                        xr = TwoPhaseXH(ir_ACout_temp, Pr_Ein_temp);                               /**储液罐出口含气率**/
+                        TrL = SaturatedLTP(Pr_Ein_temp) - 273.15, TrG = SaturatedGTP(Pr_Ein_temp) - 273.15;
+                        Rour_ACout = 1 / ((1 - xr) / SaturatedLRouT(TrL) + xr / SaturatedGRouT(TrG));                   /**储液罐出口制冷剂密度**/
+                        //N = 50;
+                        //dN = 5;
+                        //if(j >= 30)N = (N + dN) - dN * exp( - (j - 30) * dlt / 2);
+
+                        /**if (fabs(dN / N) > 0.02) {
+                            if(dN > 0)dN = 0.02 * N;
+                            else dN = -0.02 * N;
+                        }
+                        N = dN + N_BFR;
+                        if (j >= 7 && j <= 35) N = N_BFR;
+                        if (N >= 60) N = 60;
+                        if (N <= 20) N = 20;**/
+
+                        mr_CM = N * V * Rour_ACout * yt / Sr;                                       /**压缩机流量**/
+                    }
+                    outfile1<<mr_CM<<endl;
+
+
+                    /**更新冷凝器状态**/
+                    //cout<<"START CONDENSATION"<<endl;
+                    ua = 1.2;                                                                      /**冷凝器迎风速度**/
+                    //dua = 0.8;
+                    //if(j >= 15)ua = (ua + dua) - dua * exp( - (j - 15) * dlt / 2);
+                    //cout<<ua<<endl;
+                    //if(j >= 50) ua = (SaturatedLTP(Pr_Ein_temp) - 273.15 - 15) / 10 + 1.2;
+                    ha = UpdateHa();                                                               /**冷凝器对流换热系数**/
+                    rou_C_AVR = HX(j,Tain2,Yain2,mr_CM,Pr_Cin_temp,ir_Cin,Result,
+                    MTain_C,MTaout_C,MTain_C_BFR,MTaout_C_BFR,MYain_C,MYaout_C,MYain_C_BFR,MYaout_C_BFR,
+                    MTf_C,MTf_C_BFR,MWd_C,MWd_C_BFR,
+                    MPr_C,MIr_C,MTr_C,MRour_C,MWr_C,MHr_C,
+                    MPr_C_BFR,MIr_C_BFR,MTr_C_BFR,MRour_C_BFR,MWr_C_BFR,MHr_C_BFR);                /**更新冷凝器状态：调用函数HX**/
+                    cout<<j<<'\t'<<"Condenser"<<'\t'<<Result[0]<<'\t'<<Result[1]<<'\t'<<Result[2]<<'\t'<<Result[3]<<'\t'<<Result[4]<<'\t'<<Result[5]<<endl;
+
+                                                                                                   /**输出冷凝器状态**/
+                    //cout<<rou_C_AVR<<'\t'<<Result[3] * Result[4]<<endl;
+                    /**if (j <= 35) rat = 0.02;
+                    else rat = 0.006;
+                    if (fabs(dK / K) > rat) {
+                        if(dK > 0)dK = rat * K;
+                        else dK = -rat * K;
+                    }
+                    K = dK + K_BFR;
+                    if (j >= 7 && j <= 35) K = K_BFR;
+                    //if (K < 4.5e-7) K = 4.5e-7;**/
+
+                    mr_VL = Result[3] * Result[4];                                                 /**计算冷凝器出口流量**/
+                    Pr_Cin = Pr_Ein_temp + pow (mr_CM * Sr / K,2) / Result[3];                     /**迭代冷凝器压力**/
+                    //outfile1<<j<<'\t'<<"Condenser"<<'\t'<<Result[0]<<'\t'<<Result[1]<<'\t'<<Result[2]<<'\t'<<Result[3]<<'\t'<<Result[4]<<'\t'<<Result[5]<<'\t'<<Pr_Cin_temp<<'\t'<<Pr_Cin<<endl;
+                    flag_pr1 = (fabs((Pr_Cin_temp - Pr_Cin) / Pr_Cin) < 1e-5) ? 0:1;               /**判断迭代收敛与否**/
+                    //cout<<flag_pr1<<endl;
+                    /**更新迭代量**/
+                    if (times_pr1 >= 10){
+                        flag_pr1 = (fabs((Pr_Cin_temp - Pr_Cin) / Pr_Cin) < 2e-5) ? 0:1;
+                        cout<<"warning_pr1"<<'\t'<<times_pr1<<'\t'<<fabs((Pr_Cin_temp - Pr_Cin) / Pr_Cin)<<endl;
+                    }
+                    if (times_pr1 < 10) Pr_Cin_temp = Pr_Cin;
+                    else Pr_Cin_temp = Pr_Cin / 2 + Pr_Cin_temp / 2;
+                    times_pr1++;                                                                   /**计算迭代次数**/
+                }
+                //cout<<mr_VL<<'\t'<<Pr_Ein_temp<<'\t'<<Result[1]<<endl;
+
+                /**更新蒸发器状态**/
+                ua = 0.8;                                                                          /**蒸发器迎面风速**/
+                ha = UpdateHa();                                                                   /**蒸发器对流换热系数**/
+                rou_E_AVR = HX(j,Tain,Yain,mr_VL,Pr_Ein_temp,Result[1],Result,
+                            MTain_E,MTaout_E,MTain_E_BFR,MTaout_E_BFR,MYain_E,MYaout_E,MYain_E_BFR,MYaout_E_BFR,
+                            MTf_E,MTf_E_BFR,MWd_E,MWd_E_BFR,
+                            MPr_E,MIr_E,MTr_E,MRour_E,MWr_E,MHr_E,
+                            MPr_E_BFR,MIr_E_BFR,MTr_E_BFR,MRour_E_BFR,MWr_E_BFR,MHr_E_BFR);         /**更新蒸发器状态：调用函数HX**/
+                cout<<j<<'\t'<<"Eaporator"<<Result[0]<<'\t'<<Result[1]<<'\t'<<Result[2]<<'\t'<<Result[3]<<'\t'<<Result[4]<<'\t'<<Result[5]<<endl;
+                outfile1<<j<<'\t'<<"Eaporator"<<Result[0]<<'\t'<<Result[1]<<'\t'<<Result[2]<<'\t'<<Result[3]<<'\t'<<Result[4]<<'\t'<<Result[5]<<endl;
+                                                                                                    /**输出蒸发器状态**/
+                mr_ACin = Sr * Result[3] * Result[4];                                             /**计算蒸发器出口、储液罐入口流量**/
+
+                /**更新储液罐状态**/
+
+                /**迭代循环1-3-储液罐储量**/
+                flag_Gr_AC = 1;
+                times_Gr_AC = 1;
+                Gr_AC_temp = Gr_AC_BFR;
+                while (flag_Gr_AC){
+
+                    /**迭代循环1-2-储液罐出口焓值**/
+                    flag_ir_AC = 1;
+                    times_ir_AC = 1;
+                    ir_ACout_temp_In = ir_ACout_BFR;                                               /**迭代变量赋初值：储液罐出口焓**/
+                    while (flag_ir_AC){
+                        mr_ACout = - (Gr_AC_temp - Gr_AC_BFR) / dlt + mr_ACin;                     /**计算储液罐出口流量**/
+                        er_AC = ((ir_AC_BFR - pr_AC_BFR / rour_AC_BFR) * Gr_AC_BFR + (mr_ACin * Result[1] - mr_ACout * ir_ACout_temp_In) * dlt + 10 * 0.1 * (50 - Tr_AC_BFR) * dlt) / Gr_AC_temp;     /**储液罐制冷剂焓值，对流换热系数10，储液罐表面积0.1，储液罐壁面温度50**/
+
+                        /**迭代循环1-1-储液罐密度**/
+                        flag_rour_AC = 1;
+                        times_rour_AC = 1;
+                        rour_AC_temp = rour_AC_BFR;
+                        while (flag_rour_AC){
+
+                            ir_AC = er_AC + Result[0] / rour_AC_temp;
+
+                            /**判断储液罐内部状态**/
+                            TrG = SaturatedGTP(Result[0]) - 273.15, irG = 1000 * SaturatedGHT(TrG);    /**储液罐内部状态临界量计算，压力与蒸发器出口一致**/
+                            TrL = SaturatedLTP(Result[0]) - 273.15, irL = 1000 * SaturatedLHT(TrL);    /**储液罐内部状态临界量计算，压力与蒸发器出口一致**/
+                            /**两相**/
+                            if (ir_AC >= irL && ir_AC <= irG){
+                                Tr_AC = TwoPhaseTH(ir_AC, Result[0]) - 273.15;                         /**计算储液罐制冷剂温度**/
+                                xr_AC = TwoPhaseXH(ir_AC, Result[0]);                                  /**计算储液罐制冷剂含气率**/
+                                rouL = SaturatedLRouT(Tr_AC), rouG = SaturatedGRouT(Tr_AC);
+                                rour_AC = 1 / ((1 - xr_AC) / rouL + xr_AC / rouG);                     /**计算储液罐制冷剂密度**/
+                                ir_ACout_In = 1000 * SaturatedGHT(Tr_AC);                              /**计算储液罐制冷剂出口焓**/
+                                //if(j == 110)cout<<"Here!!!"<<times_Gr_AC<<'\t'<<times_ir_AC<<'\t'<<times_rour_AC<<'\t'<<Gr_AC_BFR<<'\t'<<Gr_AC<<'\t'<<Gr_AC_temp<<'\t'<<mr_ACout<<'\t'<<ir_AC_BFR<<'\t'<<ir_AC<<'\t'<<Tr_AC<<'\t'<<rour_AC<<endl;
+                            }
+                            /**非两相**/
+                            else {
+                                /**过热**/
+                                if (ir_AC >= irG){
+                                    Tr_AC = SuperHeatedTH(Result[0], ir_AC) - 273.15;                  /**计算储液罐制冷剂温度**/
+                                    rour_AC = SuperHeatedRouT(Result[0],Tr_AC);                        /**计算储液罐制冷剂密度**/
+                                    xr_AC = 1;                                                         /**计算储液罐制冷剂含气率**/
+                                    //if(j == 110)cout<<"Here!!!"<<times_Gr_AC<<'\t'<<times_ir_AC<<'\t'<<times_rour_AC<<'\t'<<Gr_AC_BFR<<'\t'<<Gr_AC<<'\t'<<Gr_AC_temp<<'\t'<<mr_ACout<<'\t'<<ir_AC_BFR<<'\t'<<ir_AC<<'\t'<<Tr_AC<<'\t'<<rour_AC<<endl;
+                                    ir_ACout_In = ir_AC;                                               /**计算储液罐出口焓**/
+                                }
+                                /**过冷**/
+                                else{
+                                    Tr_AC = SubCooledTH(Result[0], ir_AC) - 273.15;                    /**计算储液罐制冷剂温度**/
+                                    rour_AC = SubCooledRouT(Result[0],Tr_AC);                          /**计算储液罐密度**/
+                                    //cout<<"Here!!!"<<times_Gr_AC<<'\t'<<times_ir_AC<<'\t'<<times_rour_AC<<'\t'<<Gr_AC_BFR<<'\t'<<Gr_AC<<'\t'<<Gr_AC_temp<<'\t'<<mr_ACout<<'\t'<<ir_AC_BFR<<'\t'<<ir_AC<<'\t'<<Tr_AC<<'\t'<<rour_AC<<endl;
+                                    xr_AC = 0;                                                         /**计算储液罐含气率**/
+                                    ir_ACout_In = ir_AC;                                               /**计算储液罐出口焓**/
+                                    //cout<<"Subcooled"<<endl;
+                                }
+                            }
+
+                             flag_rour_AC = (fabs((rour_AC_temp - rour_AC) / rour_AC) < 1e-7) ? 0:1;   /**计算迭代判据**/
+                             rour_AC_temp = rour_AC;                                                   /**更新迭代量**/
+                             times_rour_AC++;                                                          /**计算迭代次数**/
+                             //if(times_rour_AC >= 20)cout<<"hey!!!!!!!!!!!!!!!!"<<'\t'<<times_rour_AC<<endl;
+                        }
+                        /**迭代1-1结束**/
+
+                        flag_ir_AC = (fabs((ir_ACout_temp_In - ir_ACout_In) / ir_ACout_In) < 1e-7) ? 0:1;                    /**计算迭代判据**/
+                        if(times_ir_AC >= 100){
+                            //cout<<"NOW_ir_AC!!!"<<ir_ACout_temp_In<<'\t'<<ir_ACout_In<<'\t'<<fabs((ir_ACout_temp_In - ir_ACout_In) / ir_ACout_In)<<endl;
+                            ir_ACout_temp_In = ir_ACout_In / 2 + ir_ACout_temp_In / 2;
+                        }
+                        else ir_ACout_temp_In = ir_ACout_In;                                               /**更新迭代量**/
+                        times_ir_AC++;                                                             /**计算迭代次数**/
+                    }
+                    /**迭代循环1-2结束**/
+
+                    Gr_AC = V_AC * rour_AC;                                                        /**计算储液罐储量**/
+                    if(j == 110)cout<<"Here!!!"<<times_Gr_AC<<'\t'<<times_ir_AC<<'\t'<<times_rour_AC<<'\t'<<Gr_AC_BFR<<'\t'<<Gr_AC<<'\t'<<Gr_AC_temp<<'\t'<<mr_ACout<<'\t'<<ir_AC_BFR<<'\t'<<ir_AC<<'\t'<<Tr_AC<<'\t'<<rour_AC<<endl;
+                    flag_Gr_AC = (fabs((Gr_AC_temp - Gr_AC) / Gr_AC) < 1e-7) ? 0:1;                /**计算迭代判据**/
+                    if(times_Gr_AC >= 100)cout<<"NOW_Gr_AC!!!"<<Gr_AC_temp<<'\t'<<Gr_AC<<'\t'<<fabs((Gr_AC_temp - Gr_AC) / Gr_AC)<<endl;
+                    Gr_AC_temp = Gr_AC / 2 + Gr_AC_temp / 2;                                                            /**更新迭代量**/
+                    //if (times_Gr_AC ==3) flag_Gr_AC = 0;
+                    times_Gr_AC++;                                                                 /**计算迭代次数**/
+                }
+                 cout<<Gr_AC<<'\t'<<V_AC<<'\t'<<rour_AC<<'\t'<<Tr_AC<<'\t'<<xr_AC<<endl;           /**输出储量、体积、密度、温度、含气率**/
+                /**迭代循环1-3结束**/
+
+
+                /**牛顿迭代法赋初值2-蒸发压力**/
+                if(times_pr2 == 1){
+                    if(j == 1) Pr_Ein = Pr_Ein_temp - 5e2;
+                    else {
+                        if(fabs(Pr_Ein_RES) < 5e2){
+                            if (Pr_Ein_RES >= 1)Pr_Ein = Pr_Ein_temp + 2e2;
+                            else Pr_Ein = Pr_Ein_temp - 2e2;
+                        }
+                        else Pr_Ein = Pr_Ein_temp + Pr_Ein_RES * 0.8;
+                    }
+                }
+                else Pr_Ein = (Pr_Ein_temp - Pr_Ein_temp0)/(ir_ACout_In - ir0)*(ir_ACout_temp - ir0) + Pr_Ein_temp0;     /**ir_ACout_temp目标出口焓，ir_Acout_In计算值，ir0上一时刻计算值**/
+                while (fabs(Pr_Ein - Pr_Ein_temp) > 1e4){
+                    Pr_Ein = Pr_Ein_temp / 2 + Pr_Ein / 2 ;
+                }
+
+                while (j == 8 && fabs(Pr_Ein - MPr_E_BFR[0]) > 4e4){
+                    Pr_Ein = Pr_Ein_temp / 2 + Pr_Ein / 2 ;
+                }
+
+
+                /**计算迭代指标**/
+                flag_pr2 = (fabs((ir_ACout_temp - ir_ACout_In) / ir_ACout_In) < 1e-5) ? 0:1;
+                if(times_pr2 >= 10){
+                    outfile1<<"pr2_warning!!"<<'\t'<<fabs((ir_ACout_temp - ir_ACout_In) / ir_ACout_In)<<endl;
+                    flag_pr2 = (fabs((ir_ACout_temp - ir_ACout_In) / ir_ACout_In) < 1e-4) ? 0:1;
+                    if(times_pr2 >= 20){
+                        outfile1<<"pr2_warning_20!!"<<'\t'<<fabs((ir_ACout_temp - ir_ACout_In) / ir_ACout_In)<<endl;
+                        flag_pr2 = (fabs((ir_ACout_temp - ir_ACout_In) / ir_ACout_In) < 1e-3) ? 0:1;
+                    }
+                }
+                //if(times_pr2 >= 20)break;
+                //if(j==45)cout<<Pr_Ein_temp<<'\t'<<Pr_Ein<<'\t'<<fabs((ir_Eout_temp - Result[1]) / ir_Eout_temp)<<endl;
+                Pr_Ein_temp0 = Pr_Ein_temp;
+                Pr_Ein_temp = Pr_Ein;
+                ir0 = ir_ACout_In;
+                times_pr2++;
+            }
+            /**迭代循环2结束**/
+            //if(j == 2)break;
+
+            rou_AVR = rou_C_AVR * V_HX + rou_E_AVR * V_HX + Gr_AC;
+            cout<<"attention!!"<<rou_AVR<<endl;
+
+            /**牛顿迭代法赋初值3-2**/
+            if(times_ir == 1){
+                if(j==1) ir_ACout = ir_ACout_temp - 50;
+                else{
+                    if(fabs(ir_ACout_RES) < 1e2){
+                        if (ir_ACout_RES >= 0)ir_ACout = ir_ACout_temp - 50;
+                        else ir_ACout = ir_ACout_temp + 50;
+                    }
+                    else ir_ACout = ir_ACout_temp - ir_ACout_RES * 0.2;
+                }
+            }
+            //if(times_ir == 1 && j >= 8)ir_Eout = ir_Eout_temp - 200;
+            else ir_ACout = (ir_ACout_temp - ir_ACout_temp0)/(rou_AVR - rou0)*(charge - rou0) + ir_ACout_temp0;
+
+            THD = 50;
+            /**if(j>=35){
+                if(fabs((rou_AVR - charge) / charge) > 2e-2)THD = 200;
+                else {
+                    if(fabs((rou_AVR - charge) / charge) > 1e-2)THD = 100;
+                    else THD = 50;
+                }
+            }**/
+            while (j!=1 && fabs(ir_ACout - ir_ACout_temp) > THD){
+                ir_ACout = ir_ACout_temp / 2 + ir_ACout / 2 ;
+                //if(Pr_Ein>=Pr_Ein_temp)Pr_Ein = Pr_Ein_temp + 1e4;
+                //else Pr_Ein = Pr_Ein_temp - 1e4;
+            }
+            outfile1<<j<<'\t'<<times_ir<<'\t'<<ir_ACout_temp<<'\t'<<rou_AVR<<'\t'<<times_pr2<<'\t'<<ir_ACout_RES<<'\t'<<Pr_Ein_RES<<endl;
+            cout<<j<<'\t'<<times_ir<<'\t'<<ir_ACout_temp<<'\t'<<rou_AVR<<'\t'<<times_pr2<<'\t'<<ir_ACout_RES<<'\t'<<Pr_Ein_RES<<endl;
+            flag_ir = (fabs((rou_AVR - charge) / charge) < 1e-3) ? 0:1;
+
+            ir_ACout_temp0 = ir_ACout_temp;
+            ir_ACout_temp = ir_ACout;
+            rou0 = rou_AVR;
+            times_ir++;
+        }
+        /**循环3结束**/
+
+        /**更新迭代量的变化速率**/
+        Pr_Ein_RES = MPr_E[0] - MPr_E_BFR[0];
+        ir_ACout_RES =  ir_ACout - ir_ACout_BFR;
+        //if(j >= 8)ir_Eout_temp = MIr_E_BFR[cycle_XYZ + 1] - 100;
+        Pr_Cin_RES = MPr_C[0] - MPr_C_BFR[0];
+        outfile1<<j<<'\t'<<Pr_Ein_RES<<'\t'<<ir_ACout_RES<<'\t'<<Pr_Cin_RES<<'\t'<<MIr_E[cycle_XYZ + 1]<<'\t'<<MIr_E_BFR[cycle_XYZ + 1]<<'\t'<<ir_ACout<<endl;
+
+        /**更新过热度**/
+        TrG = SaturatedGTP(MPr_E[cycle_XYZ + 1]) - 273.15, irG = 1000 * SaturatedGHT(TrG);
+        if (MIr_E[cycle_XYZ+1] > irG) DLT = MTr_E[cycle_XYZ + 1] - TrG;
+        else {
+            cp = (1000 * SuperHeatedHT(MPr_E[cycle_XYZ+1],TrG + 1) - 1000 * SaturatedGHT(TrG));
+            DLT = (MIr_E[cycle_XYZ + 1] - irG) / cp;
+        }
+        Tc = SaturatedGTP(MPr_C[0]) - 273.15;
+        cout<<TrG<<'\t'<<irG<<'\t'<<MTr_E[cycle_XYZ + 1]<<'\t'<<MIr_E[cycle_XYZ+1]<<endl;
+
+        /**输出几个特定时间点制冷剂沿流程状态**/
+        if(j==10||j==20||j==30||j==60||j==90||j==120||j==150||j==180){
+           outfilePr<<j<<endl;
+           for(i=0;i<=cycle_XYZ + 1;i++){
+                outfilePr<<i<<'\t'<<MPr_E[i]<<'\t'<<MIr_E[i]<<'\t'<<MTr_E[i]<<'\t'<<MHr_E[i]<<'\t'<<MRour_E[i]<<'\t'<<MWr_E[i];
+                outfilePr<<'\t'<<MPr_C[i]<<'\t'<<MIr_C[i]<<'\t'<<MTr_C[i]<<'\t'<<MHr_C[i]<<'\t'<<MRour_C[i]<<'\t'<<MWr_C[i]<<endl;
+           }
+        }
+
+        /**输出"初始时刻j=1"的制冷剂传递状态**/
+        for(i = 0;i <= cycle_XYZ + 1;i++){
+
+            if(j == 1){
+                outfileMr1<<MRour_E_BFR[i]*MWr_E_BFR[i]<<'('<<i<<'\t'<<MRour_E_BFR[i]<<'\t'<<MWr_E_BFR[i]<<')'<<'\t';
+                if( i % (ny * ntx) == 0)outfileMr1<<endl;
+                outfilePr1<<MPr_E_BFR[i]<<'('<<i<<'\t'<<MTr_E_BFR[i]<<')'<<'\t';
+                if( i % (ny * ntx) == 0)outfilePr1<<endl;
+                outfileIr1<<MIr_E_BFR[i]<<'('<<i<<'\t'<<MHr_E_BFR[i]<<')'<<'\t';
+                if( i % (ny * ntx) == 0)outfileIr1<<endl;
+
+                outfileMr2<<MRour_C_BFR[i]*MWr_C_BFR[i]<<'('<<i<<'\t'<<MRour_C_BFR[i]<<'\t'<<MWr_C_BFR[i]<<')'<<'\t';
+                if( i % (ny * ntx) == 0)outfileMr2<<endl;
+                outfilePr2<<MPr_C_BFR[i]<<'('<<i<<'\t'<<MTr_C_BFR[i]<<')'<<'\t';
+                if( i % (ny * ntx) == 0)outfilePr2<<endl;
+                outfileIr2<<MIr_C_BFR[i]<<'('<<i<<'\t'<<MHr_C_BFR[i]<<')'<<'\t';
+                if( i % (ny * ntx) == 0)outfileIr2<<endl;
+                outfilePr<<i<<'\t'<<MPr_E[i]<<'\t'<<MIr_E[i]<<'\t'<<MTr_E[i]<<'\t'<<MHr_E[i]<<'\t'<<MRour_E[i]<<'\t'<<MWr_E[i];
+                outfilePr<<'\t'<<MPr_C[i]<<'\t'<<MIr_C[i]<<'\t'<<MIr_C[i]<<'\t'<<MTr_C[i]<<'\t'<<MHr_C[i]<<'\t'<<MRour_C[i]<<'\t'<<MWr_C[i]<<endl;
+
+           }
+        }
+        for (p = 0;p <= 4;p++){
+
+            Ta_E_AVR[p] = 0;
+            Ya_E_AVR[p] = 0;
+            Ta_C_AVR[p] = 0;
+            Ya_C_AVR[p] = 0;
+
+            Tf_E_AVR[p] = 0;
+            Wd_E_AVR[p] = 0;
+            Tf_C_AVR[p] = 0;
+            Wd_C_AVR[p] = 0;
+        }
+
+        /**输出文件**/
+        for(i = 0;i <= cycle_XYZ + 1;i++){
+
+           /**输出下次迭代的初值**/
+            if(j == 180){
+                outfile2<<cycle_XYZ + 1 - i<<'\t'<<MTf_E[cycle_XYZ + 1 - i]<<'\t'<<MWd_E[cycle_XYZ + 1 - i]<<'\t'<<MTf_C[cycle_XYZ + 1 - i]<<'\t'<<MWd_C[cycle_XYZ + 1 - i];
+                outfile2<<'\t'<<MTain_E[cycle_XYZ + 1 - i]<<'\t'<<MTaout_E[cycle_XYZ + 1 - i]<<'\t'<<MYain_E[cycle_XYZ + 1 - i]<<'\t'<<MYaout_E[cycle_XYZ + 1 - i];
+                outfile2<<'\t'<<MTain_C[cycle_XYZ + 1 - i]<<'\t'<<MTaout_C[cycle_XYZ + 1 - i]<<'\t'<<MYain_C[cycle_XYZ + 1 - i]<<'\t'<<MYaout_C[cycle_XYZ + 1 - i]<<endl;
+            }
+
+            if(!i)outfileMr1<<endl<<j<<endl;
+            if(!i)outfilePr1<<endl<<j<<endl;
+            if(!i)outfileIr1<<endl<<j<<endl;
+            if(!i)outfileTaout1<<endl<<j<<endl;
+            if(!i)outfileYaout1<<endl<<j<<endl;
+            if(!i)outfileTf1<<endl<<j<<endl;
+            if(!i)outfileWd1<<endl<<j<<endl;
+
+            outfileTaout1<<MTaout_E[i]<<'('<<i<<'\t'<<MTain_E[i]<<')'<<'\t';
+            if(i % (ny * ntx) == 0)outfileTaout1<<endl;
+            outfileYaout1<<MYaout_E[i]<<'('<<i<<'\t'<<MYain_E[i]<<')'<<'\t';
+            if(i % (ny * ntx) == 0)outfileYaout1<<endl;
+            outfileTf1<<MTf_E[i]<<'('<<i<<')'<<'\t';
+            if(i % (ny * ntx) == 0)outfileTf1<<endl;
+            outfileWd1<<MWd_E[i]<<'('<<i<<')'<<'\t';
+            if(i % (ny * ntx) == 0)outfileWd1<<endl;
+
+            outfileMr1<<MRour_E[i]*MWr_E[i]<<'('<<i<<'\t'<<MRour_E[i]<<'\t'<<MWr_E[i]<<')'<<'\t';
+            if(i % (ny * ntx) == 0)outfileMr1<<endl;
+            outfilePr1<<MPr_E[i]<<'('<<i<<'\t'<<MTr_E[i]<<')'<<'\t';
+            if(i % (ny * ntx) == 0)outfilePr1<<endl;
+            outfileIr1<<MIr_E[i]<<'('<<i<<'\t'<<MHr_E[i]<<')'<<'\t';
+            if(i % (ny * ntx) == 0)outfileIr1<<endl;
+
+            if(!i)outfileMr2<<endl<<j<<endl;
+            if(!i)outfilePr2<<endl<<j<<endl;
+            if(!i)outfileIr2<<endl<<j<<endl;
+            if(!i)outfileTaout2<<endl<<j<<endl;
+            if(!i)outfileYaout2<<endl<<j<<endl;
+            if(!i)outfileTf2<<endl<<j<<endl;
+            if(!i)outfileWd2<<endl<<j<<endl;
+
+            outfileMr2<<MRour_C[i]*MWr_C[i]<<'('<<i<<'\t'<<MRour_C[i]<<'\t'<<MWr_C[i]<<')'<<'\t';
+            if(i % (ny * ntx) == 0)outfileMr2<<endl;
+            outfilePr2<<MPr_C[i]<<'('<<i<<'\t'<<MTr_C[i]<<')'<<'\t';
+            if(i % (ny * ntx) == 0)outfilePr2<<endl;
+            outfileIr2<<MIr_C[i]<<'('<<i<<'\t'<<MHr_C[i]<<')'<<'\t';
+            if(i % (ny * ntx) == 0)outfileIr2<<endl;
+
+            outfileTaout2<<MTaout_C[i]<<'('<<i<<'\t'<<MTain_C[i]<<')'<<'\t';
+            if(i % (ny * ntx) == 0)outfileTaout2<<endl;
+            outfileYaout2<<MYaout_C[i]<<'('<<i<<'\t'<<MYain_C[i]<<')'<<'\t';
+            if(i % (ny * ntx) == 0)outfileYaout2<<endl;
+            outfileTf2<<MTf_C[i]<<'('<<i<<')'<<'\t';
+            if(i % (ny * ntx) == 0)outfileTf2<<endl;
+            outfileWd2<<MWd_C[i]<<'('<<i<<')'<<'\t';
+            if(i % (ny * ntx) == 0)outfileWd2<<endl;
+
+
+            MTain_E_BFR[i] = MTain_E[i], MTaout_E_BFR[i] = MTaout_E[i];
+            MTain_C_BFR[i] = MTain_C[i], MTaout_C_BFR[i] = MTaout_C[i];
+            MYain_E_BFR[i] = MYain_E[i], MYaout_E_BFR[i] = MYaout_E[i];
+            MYain_C_BFR[i] = MYain_C[i], MYaout_C_BFR[i] = MYaout_C[i];
+
+            MTf_E_BFR[i] = MTf_E[i], MTf_C_BFR[i] = MTf_C[i];
+            MWd_E_BFR[i] = MWd_E[i], MWd_C_BFR[i] = MWd_C[i];
+
+            MPr_E_BFR[i] = MPr_E[i], MPr_C_BFR[i] = MPr_C[i];
+            MIr_E_BFR[i] = MIr_E[i], MIr_C_BFR[i] = MIr_C[i];
+            MRour_E_BFR[i] = MRour_E[i], MRour_C_BFR[i] = MRour_C[i];
+            MWr_E_BFR[i] = MWr_E[i], MWr_C_BFR[i] = MWr_C[i];
+            MTr_E_BFR[i] = MTr_E[i], MTr_C_BFR[i] = MTr_C[i];
+            MHr_E_BFR[i] = MHr_E[i], MHr_C_BFR[i] = MHr_C[i];
+
+            if (i!=0 && i != cycle_XYZ + 1){
+                Ta_E_AVR[((i - 1) / ny) % ntx] = Ta_E_AVR[((i - 1) / ny) % ntx] + MTaout_E[i] / ny / ntz;
+                Ya_E_AVR[((i - 1) / ny) % ntx] = Ya_E_AVR[((i - 1) / ny) % ntx] + MYaout_E[i] / ny / ntz;
+                Ta_C_AVR[((i - 1) / ny) % ntx] = Ta_C_AVR[((i - 1) / ny) % ntx] + MTaout_C[i] / ny / ntz;
+                Ya_C_AVR[((i - 1) / ny) % ntx] = Ya_C_AVR[((i - 1) / ny) % ntx] + MYaout_C[i] / ny / ntz;
+                Tf_E_AVR[((i - 1) / ny) % ntx] = Tf_E_AVR[((i - 1) / ny) % ntx] + MTf_E[i] / ny / ntz;
+                Wd_E_AVR[((i - 1) / ny) % ntx] = Wd_E_AVR[((i - 1) / ny) % ntx] + MWd_E[i] / ny / ntz;
+                Tf_C_AVR[((i - 1) / ny) % ntx] = Tf_C_AVR[((i - 1) / ny) % ntx] + MTf_C[i] / ny / ntz;
+                Wd_C_AVR[((i - 1) / ny) % ntx] = Wd_C_AVR[((i - 1) / ny) % ntx] + MWd_C[i] / ny / ntz;
+            }
+        }
+
+        for (p = 0;p <= 3;p++){
+            Tf_E_AVR[4] = Tf_E_AVR[p] / 4 + Tf_E_AVR[4];
+            Wd_E_AVR[4] = Wd_E_AVR[p] / 4 + Wd_E_AVR[4];
+            Tf_C_AVR[4] = Tf_C_AVR[p] / 4 + Tf_C_AVR[4];
+            Wd_C_AVR[4] = Wd_C_AVR[p] / 4 + Wd_C_AVR[4];
+        }
+
+        outfileMr<<j<<'\t'<<SaturatedLTP(MPr_E[0]) - 273.15<<'\t'<<SaturatedLTP(MPr_E[cycle_XYZ + 1]) - 273.15<<'\t'<<SaturatedGTP(MPr_C[0]) - 273.15<<'\t'<<SaturatedGTP(MPr_C[cycle_XYZ + 1]) - 273.15<<'\t'<<DLT;
+        outfileMr<<'\t'<<mr_VL<<'\t'<<MWr_E[cycle_XYZ + 1] * MRour_E[cycle_XYZ + 1]<<'\t'<<mr_CM;
+        outfileMr<<'\t'<<Tf_E_AVR[4]<<'\t'<<Wd_E_AVR[4]<<'\t'<<ConvertYd(Tf_E_AVR[4], Wd_E_AVR[4])<<'\t'<<Tf_C_AVR[4]<<'\t'<<Wd_C_AVR[4]<<'\t'<<ConvertYd(Tf_C_AVR[4], Wd_C_AVR[4]);
+        outfileMr<<'\t'<<MTf_E[8]<<'\t'<<MWd_E[8]<<'\t'<<ConvertYd(MTf_E[8], MWd_E[8])<<'\t'<<MTf_E[40]<<'\t'<<MWd_E[40]<<'\t'<<ConvertYd(MTf_E[40], MWd_E[40])<<'\t'<<MTf_E[72]<<'\t'<<MWd_E[72]<<'\t'<<ConvertYd(MTf_E[72], MWd_E[72]);
+        outfileMr<<'\t'<<MTf_E[100]<<'\t'<<MWd_E[100]<<'\t'<<ConvertYd(MTf_E[100], MWd_E[100])<<'\t'<<MTf_E[104]<<'\t'<<MWd_E[104]<<'\t'<<ConvertYd(MTf_E[104], MWd_E[104])<<'\t'<<MTf_E[108]<<'\t'<<MWd_E[108]<<'\t'<<ConvertYd(MTf_E[108], MWd_E[108])<<'\t'<<MTf_E[112]<<'\t'<<MWd_E[112]<<'\t'<<ConvertYd(MTf_E[112], MWd_E[112]);
+        outfileMr<<'\t'<<MTf_E[136]<<'\t'<<MWd_E[136]<<'\t'<<ConvertYd(MTf_E[136], MWd_E[136])<<'\t'<<MTf_E[168]<<'\t'<<MWd_E[168]<<'\t'<<ConvertYd(MTf_E[168], MWd_E[168]);
+        outfileMr<<'\t'<<MTf_C[185]<<'\t'<<MWd_C[185]<<'\t'<<ConvertYd(MTf_C[185], MWd_C[185])<<'\t'<<MTf_C[153]<<'\t'<<MWd_C[153]<<'\t'<<ConvertYd(MTf_C[153], MWd_C[153])<<'\t'<<MTf_C[121]<<'\t'<<MWd_C[121]<<'\t'<<ConvertYd(MTf_C[121], MWd_C[121]);
+        outfileMr<<'\t'<<MTf_C[93]<<'\t'<<MWd_C[93]<<'\t'<<ConvertYd(MTf_C[93], MWd_C[93])<<'\t'<<MTf_C[89]<<'\t'<<MWd_C[89]<<'\t'<<ConvertYd(MTf_C[89], MWd_C[89])<<'\t'<<MTf_C[85]<<'\t'<<MWd_C[85]<<'\t'<<ConvertYd(MTf_C[85], MWd_C[85])<<'\t'<<MTf_C[81]<<'\t'<<MWd_C[81]<<'\t'<<ConvertYd(MTf_C[81], MWd_C[81]);
+        outfileMr<<'\t'<<MTf_C[57]<<'\t'<<MWd_C[57]<<'\t'<<ConvertYd(MTf_C[57], MWd_C[57])<<'\t'<<MTf_C[25]<<'\t'<<MWd_C[25]<<'\t'<<ConvertYd(MTf_C[25], MWd_C[25]);
+        outfileMr<<endl;
+
+        outfileIr<<j<<'\t'<<Ta_E_AVR[0]<<'\t'<<Ya_E_AVR[0]<<'\t'<<Ta_C_AVR[0]<<'\t'<<Ya_C_AVR[0]<<'\t'<<Tf_E_AVR[0]<<'\t'<<ConvertYd(Tf_E_AVR[0], Wd_E_AVR[0])<<'\t'<<Tf_C_AVR[0]<<'\t'<<ConvertYd(Tf_C_AVR[0], Wd_C_AVR[0]);
+        outfileIr<<'\t'<<Ta_E_AVR[1]<<'\t'<<Ya_E_AVR[1]<<'\t'<<Ta_C_AVR[1]<<'\t'<<Ya_C_AVR[1]<<'\t'<<Tf_E_AVR[1]<<'\t'<<ConvertYd(Tf_E_AVR[1], Wd_E_AVR[1])<<'\t'<<Tf_C_AVR[1]<<'\t'<<ConvertYd(Tf_C_AVR[1], Wd_C_AVR[1]);
+        outfileIr<<'\t'<<Ta_E_AVR[2]<<'\t'<<Ya_E_AVR[2]<<'\t'<<Ta_C_AVR[2]<<'\t'<<Ya_C_AVR[2]<<'\t'<<Tf_E_AVR[2]<<'\t'<<ConvertYd(Tf_E_AVR[2], Wd_E_AVR[2])<<'\t'<<Tf_C_AVR[2]<<'\t'<<ConvertYd(Tf_C_AVR[2], Wd_C_AVR[2]);
+        outfileIr<<'\t'<<Ta_E_AVR[3]<<'\t'<<Ya_E_AVR[3]<<'\t'<<Ta_C_AVR[3]<<'\t'<<Ya_C_AVR[3]<<'\t'<<Tf_E_AVR[3]<<'\t'<<ConvertYd(Tf_E_AVR[3], Wd_E_AVR[3])<<'\t'<<Tf_C_AVR[3]<<'\t'<<ConvertYd(Tf_C_AVR[3], Wd_C_AVR[3]);
+        outfileIr<<'\t'<< - 1000 * 0.8 * roua * 0.32 * 0.288 * (1.01 * Ta_E_AVR[3] - 1.01 * Tain);
+        outfileIr<<'\t'<< - 1000 * 0.8 * roua * 0.32 * 0.288 * (Ya_E_AVR[3] * (1.84 * Ta_E_AVR[3] + 2700) / 1000 - Yain * (1.84 * Tain + 2700) / 1000);
+        outfileIr<<'\t'<<MIr_E[0]<<'\t'<<MIr_E[cycle_XYZ + 1]<<'\t'<<ir_ACout<<'\t'<<MIr_C[0];
+        outfileIr<<'\t'<<(MIr_E[cycle_XYZ + 1] - MIr_E[0]) * (mr_VL + mr_ACin / Sr) * Sr / 2<<'\t'<<(MIr_E[cycle_XYZ + 1] - MIr_E[0]) * mr_VL * Sr<<'\t'<<MIr_E[cycle_XYZ + 1] * mr_ACin - MIr_E[0] * mr_VL * Sr;
+        outfileIr<<'\t'<<(MIr_C[0] - ir_ACout)* Sr * mr_CM<<'\t'<<(MIr_C[0] - ir_ACout)* Sr * mr_CM / yt;
+        outfileIr<<'\t'<<rou_C_AVR * V_HX<<'\t'<<rou_E_AVR * V_HX <<'\t'<<Gr_AC<<'\t'<<ir_AC<<'\t'<<rour_AC<<'\t'<<xr_AC<<endl;
+    }
+
+    outfileMr.close();
+    outfilePr.close();
+    outfileIr.close();
+
+    outfileMr1.close();
+    outfilePr1.close();
+    outfileIr1.close();
+    outfileMr2.close();
+    outfilePr2.close();
+    outfileIr2.close();
+
+    outfileTaout1.close();
+    outfileYaout1.close();
+    outfileTf1.close();
+    outfileWd1.close();
+
+    outfileTaout2.close();
+    outfileYaout2.close();
+    outfileTf2.close();
+    outfileWd2.close();
+
+    outfile1.close();
+    outfile2.close();
+
+    infile1.close();
+    infile2.close();
+
+    return 0;
+}
+
+double UpdateHa(){
+
+    double d1, d2;
+    double Ao, Afr;
+    double af, tht, Dh, dc;
+    double Umax, REa, PRa;
+    double c3, c4, c5, c6, j;
+    double ha;
+
+    d1 = dlz - 2 * Ro;
+    d2 = 2 * (pow(pow(dlz / 2, 2) + pow(dlx, 2), 0.5) - 2 * Ro);
+    if(d1 < d2) Ao = nf * Pf * (1 - (tf + 2 * td) / Pf) * ((ntz - 1) * d1 + d1);
+    else Ao = nf * Pf * (1 - (tf + 2 * td) / Pf) * ((ntz - 1) * d2 + d1);
+    Afr = nf * Pf * dlz * ntz;
+
+    af = Aa / Va;
+    tht = Ao / Afr;
+    Dh = 4 * tht / af;
+    dc = 2 * Ro + 2 * td + 2 * tf;
+
+    Umax = ua * Afr / Ao;
+    REa = roua * Umax * dc / mua;
+    PRa = mua * cpa / ka;                                                              /**普朗克常数：定义式**/
+
+    c3 = - 0.361 - 0.042 * ntx / log(REa) + 0.158 * log(ntx * pow(Pf / dc, 0.41));
+    c4 = - 1.224 - 0.076 * pow(dlx / Dh, 1.42) / log(REa);
+    c5 = - 0.083 + 0.058 * ntx / log(REa);
+    c6 = - 5.735 + 1.21 * log(REa / ntx);
+    j = 0.086 * pow(REa, c3) * pow(ntx, c4) * pow(Pf / dc, c5) * pow(Pf / Dh, c6) * pow(Pf / dlz, -0.93);
+
+    ha = j / pow(PRa, 2.0 / 3) * roua * Umax * cpa;
+
+    return ha;
+}
+
+
+
